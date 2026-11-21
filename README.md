@@ -11,16 +11,26 @@ per-worker egress IPs for high-throughput API clients.
 
 - **CONNECT proxy** on `0.0.0.0:8888` (HTTPS tunneling; plain-HTTP forward
   proxying intentionally unsupported)
-- **`GET /healthz`** on the same port — `200` only while `tun0` exists
-  (used by the Docker `HEALTHCHECK`)
+- **`GET /healthz`** on the same port — `200` only while `tun0` exists *and*
+  the tunnel watchdog reports connectivity (used by the Docker `HEALTHCHECK`)
+- **Tunnel watchdog**: every `OXITUN_PROBE_INTERVAL_SECS` (default 20s) the
+  supervisor probes the data path — TCP connect to a literal IP
+  (`OXITUN_PROBE_IP`, default `1.1.1.1:443`), DNS resolution and TCP connect
+  to `OXITUN_PROBE_HOST`/`OXITUN_PROBE_PORT` (default `blockchain.info:443`).
+  After `OXITUN_PROBE_MAX_FAILS` (default 3) consecutive *infrastructure*
+  failures the process exits → Docker `restart` rebuilds the tunnel.
+  Destination-only failures degrade `/healthz` without restarting (a restart
+  would reconnect to the same profile server anyway). Probe start is jittered
+  per container to avoid synchronized restart storms.
 - **Killswitch (iptables + ip6tables)**: default-DROP on INPUT/FORWARD/OUTPUT;
   traffic may only leave via `tun0` or the VPN server itself — no IP leaks
   if the tunnel drops
 - **Tunnel DNS** pinned to the provider resolver (default `10.2.0.1`,
   ProtonVPN); external DNS is unreachable under the killswitch
 - **OpenVPN supervision**: restarts remote failover flags
-  (`--connect-retry-max`, `--connect-timeout`, `--hand-window`) so dead
-  free-tier servers are skipped instead of hanging forever; the process
+  (`--connect-retry-max`, `--connect-timeout`, `--hand-window`) plus
+  `--ping 10 --ping-restart 60` keepalive so a dead session is detected and
+  renegotiated instead of lingering as a zombie tunnel; the process
   exits when `openvpn` dies → Docker `restart` policy takes over
 - **Zero runtime deps beyond `openvpn`**: the supervisor *is* the binary
 
@@ -94,6 +104,11 @@ docker build -t oxitun .
 | `PROXY_PORT` | `8888` | CONNECT proxy listen port |
 | `VPN_DNS` | `10.2.0.1` | Resolver forced inside the tunnel |
 | `KILLSWITCH` | `on` | `off` disables iptables rules (**debug only**) |
+| `OXITUN_PROBE_HOST` | `blockchain.info` | Hostname probed by the watchdog (DNS + TCP) |
+| `OXITUN_PROBE_PORT` | `443` | Port for the hostname probe |
+| `OXITUN_PROBE_IP` | `1.1.1.1:443` | Literal-IP probe (data path, no DNS) |
+| `OXITUN_PROBE_INTERVAL_SECS` | `20` | Seconds between watchdog rounds |
+| `OXITUN_PROBE_MAX_FAILS` | `3` | Consecutive infra failures before exit |
 
 Values may be wrapped in single or double quotes — they are stripped.
 
@@ -120,8 +135,10 @@ The published image is multi-stage (`rust:alpine` → `alpine:3.20`) and only
 - Plain-HTTP forward proxying is not implemented (CONNECT only)
 - Run **one tunnel per container**; scale by running N containers
 - Tested with ProtonVPN free-server profiles; other providers unverified
-- Free-tier servers are flaky by nature — pair this with an external
-  health-check/restart loop if you need automatic profile rotation
+- Free-tier servers are flaky by nature — the built-in watchdog covers dead
+  tunnels; pair with an external health-check/restart loop if you need
+  automatic profile *rotation* (a restart always reconnects to the same
+  `remote` in the profile)
 
 ## Build
 
