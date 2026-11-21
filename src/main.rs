@@ -13,7 +13,6 @@ mod proxy;
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::net::ToSocketAddrs;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -214,14 +213,6 @@ fn run_inner() -> Result<i32, String> {
         // answers the push must not hang the tunnel indefinitely.
         .arg("--hand-window")
         .arg("20")
-        // Keepalive: without ping/ping-restart a dead tunnel stays up
-        // forever (tun0 exists, zero traffic) — observed in production.
-        // NOTE: --explicit-exit-notify is UDP-only; all shipped profiles
-        // are TCP, so it is intentionally omitted.
-        .arg("--ping")
-        .arg("10")
-        .arg("--ping-restart")
-        .arg("60")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -254,85 +245,6 @@ fn run_inner() -> Result<i32, String> {
     // Give the listener a moment to bind before reporting healthy.
     thread::sleep(Duration::from_millis(300));
     log(&format!("proxy listening on :{proxy_port}"));
-
-    // Watchdog: probe real connectivity through tun0. A dead tunnel must not
-    // stay "healthy" forever — after OXITUN_PROBE_MAX_FAILS consecutive
-    // infrastructure failures the process exits so Docker restart policy
-    // rebuilds it.
-    //
-    // Two probes per round:
-    //   ip_ok    — TCP connect to a literal IP (data path through tun0)
-    //   dns_ok   — resolve the workload hostname via resolv.conf (10.2.0.1);
-    //              covers the original failure mode where tunnel DNS died
-    //   dst_ok   — TCP connect to the resolved workload host
-    // Restart only on infrastructure failure (ip_ok || dns_ok false).
-    // dst_ok failing alone means the exit node/path to that destination is
-    // bad — restarting reconnects to the SAME profile server, so it would
-    // not help and could storm the provider.
-    let probe_host = env_or("OXITUN_PROBE_HOST", "blockchain.info");
-    let probe_port: u16 = env_or("OXITUN_PROBE_PORT", "443")
-        .parse()
-        .unwrap_or(443);
-    let probe_ip: std::net::SocketAddr = env_or("OXITUN_PROBE_IP", "1.1.1.1:443")
-        .parse()
-        .unwrap_or_else(|_| "1.1.1.1:443".parse().unwrap());
-    let probe_interval = env_or("OXITUN_PROBE_INTERVAL_SECS", "20")
-        .parse::<u64>()
-        .unwrap_or(20)
-        .max(1);
-    let probe_max_fails = env_or("OXITUN_PROBE_MAX_FAILS", "3")
-        .parse::<u32>()
-        .unwrap_or(3)
-        .max(1);
-    thread::spawn(move || {
-        // Jittered start: pid differs per container, so probes don't fire
-        // in phase after a mass restart event.
-        thread::sleep(Duration::from_secs((std::process::id() % 25) as u64));
-        let mut fails = 0u32;
-        loop {
-            thread::sleep(Duration::from_secs(probe_interval));
-            if !tun0_exists() {
-                // openvpn is (re)connecting — its own ping-restart/exit
-                // handles this case; don't count it as a probe failure.
-                fails = 0;
-                proxy::set_probe_fails(0);
-                continue;
-            }
-            let ip_ok = std::net::TcpStream::connect_timeout(&probe_ip, Duration::from_secs(5))
-                .is_ok();
-            let dns_ok = format!("{probe_host}:{probe_port}")
-                .to_socket_addrs()
-                .map(|mut it| it.next().is_some())
-                .unwrap_or(false);
-            let dst_ok = dns_ok
-                && format!("{probe_host}:{probe_port}")
-                    .to_socket_addrs()
-                    .ok()
-                    .and_then(|mut it| it.next())
-                    .map(|a| {
-                        std::net::TcpStream::connect_timeout(&a, Duration::from_secs(5)).is_ok()
-                    })
-                    .unwrap_or(false);
-            let infra_ok = ip_ok && dns_ok;
-            if infra_ok {
-                fails = 0;
-                // dst failure alone still degrades the worker path —
-                // report it via /healthz without restarting the container.
-                proxy::set_probe_fails(if dst_ok { 0 } else { 1 });
-                continue;
-            }
-            fails += 1;
-            proxy::set_probe_fails(fails.min(u8::MAX as u32) as u8);
-            eprintln!(
-                "[oxitun] watchdog: infra probe failed ip_ok={ip_ok} dns_ok={dns_ok} \
-                 dst_ok={dst_ok} ({fails}/{probe_max_fails})"
-            );
-            if fails >= probe_max_fails {
-                eprintln!("[oxitun] watchdog: tunnel dead — exiting for container restart");
-                std::process::exit(1);
-            }
-        }
-    });
 
     let status = child.wait().map_err(|e| format!("wait openvpn: {e}"))?;
     log(&format!("openvpn exited ({status}) — container will restart"));

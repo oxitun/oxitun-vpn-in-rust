@@ -6,27 +6,11 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(15);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Consecutive tunnel-probe failures reported by the main watchdog.
-/// /healthz returns 503 once this reaches the threshold — tun0 alone is
-/// not proof of a working tunnel.
-static PROBE_FAILS: AtomicU8 = AtomicU8::new(0);
-const PROBE_UNHEALTHY_THRESHOLD: u8 = 2;
-
-pub fn set_probe_fails(n: u8) {
-    PROBE_FAILS.store(n, Ordering::Relaxed);
-}
-
-fn probe_failing() -> bool {
-    PROBE_FAILS.load(Ordering::Relaxed) >= PROBE_UNHEALTHY_THRESHOLD
-}
 
 fn tun0_up() -> bool {
     Path::new("/sys/class/net/tun0").exists()
@@ -81,10 +65,9 @@ fn handle_client(mut client: TcpStream) {
         _ => return,
     };
 
-    // GET /healthz — liveness for Docker HEALTHCHECK; 503 while tun0 is down
-    // or the watchdog reports consecutive tunnel probe failures.
+    // GET /healthz — liveness for Docker HEALTHCHECK; 503 while tun0 is down.
     if method == "GET" && target == "/healthz" {
-        if tun0_up() && !probe_failing() {
+        if tun0_up() {
             respond(&mut client, "200 OK", "ok");
         } else {
             respond(&mut client, "503 Service Unavailable", "tun0 down");
@@ -115,7 +98,7 @@ fn handle_client(mut client: TcpStream) {
         respond(&mut client, "502 Bad Gateway", "no address");
         return;
     };
-    let Ok(upstream) = TcpStream::connect_timeout(&upstream_addr, CONNECT_TIMEOUT) else {
+    let Ok(upstream) = TcpStream::connect(upstream_addr) else {
         respond(&mut client, "502 Bad Gateway", "connect failed");
         return;
     };
