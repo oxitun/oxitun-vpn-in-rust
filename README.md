@@ -150,28 +150,6 @@ docker build -t oxitun .
 # or locally: cargo build --release
 ```
 
-## Git & releases
-
-Commits are local-only until pushed — committing never publishes anything.
-Publishing to `ghcr.io/oxitun/oxitun` is done by the GitHub Actions
-workflow (`.github/workflows/docker.yml`) and happens **only** on:
-
-- `git push origin main` → updates the `latest` tag
-- `git push origin vX.Y.Z` (tag `v*`) → also publishes a semver tag
-
-To work without publishing, push to a branch instead:
-
-```bash
-git checkout -b my-feature
-git commit -am "..."
-git push -u origin my-feature   # CI does NOT run on non-main branches
-```
-
-Or simply don't push at all — `git commit` stays on your machine.
-Manual `docker push` requires a GitHub PAT with `write:packages`;
-the CI path needs no local credentials (`GITHUB_TOKEN` has
-`packages: write`).
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
