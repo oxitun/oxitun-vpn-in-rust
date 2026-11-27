@@ -1,7 +1,8 @@
 # oxitun
 
-Minimal OpenVPN tunnel container: **HTTP CONNECT proxy + killswitch firewall
-+ process supervisor** in a single small static Rust binary.
+Minimal OpenVPN tunnel container: **HTTP CONNECT + SOCKS5 proxy (TCP and
+UDP) + killswitch firewall + process supervisor** in a single small static
+Rust binary.
 
 A lean, single-binary alternative to VPN sidecar images (e.g. Gluetun) for
 workloads that only need "traffic out through a specific tunnel" — such as
@@ -11,6 +12,12 @@ per-worker egress IPs for high-throughput API clients.
 
 - **CONNECT proxy** on `0.0.0.0:8888` (HTTPS tunneling; plain-HTTP forward
   proxying intentionally unsupported)
+- **SOCKS5 on the same port** — TCP `CONNECT` and `UDP ASSOCIATE`,
+  dispatched by the first byte (`0x05` = SOCKS5, anything else = HTTP).
+  UDP datagrams are relayed through a per-association upstream socket, so
+  DNS/QUIC/STUN-style traffic can exit via `tun0` too. Requires publishing
+  the port as `/udp` (see compose) and the killswitch already allows UDP
+  outbound via `tun0` and the VPN `remote` IPs.
 - **`GET /healthz`** on the same port — `200` only while `tun0` exists
   (used by the Docker `HEALTHCHECK`)
 - **Killswitch (iptables + ip6tables)**: default-DROP on INPUT/FORWARD/OUTPUT;
@@ -44,15 +51,23 @@ docker run -d \
   -e VPN_PASS='your-pass' \
   -v /path/to/profile.ovpn:/etc/openvpn/client.ovpn:ro \
   -p 127.0.0.1:18011:8888 \
+  -p 127.0.0.1:18011:8888/udp \
   oxitun
 ```
 
 Then:
 
 ```bash
-curl -x http://127.0.0.1:18011 https://api.ipify.org   # exit IP of the tunnel
-curl http://127.0.0.1:18011/healthz                    # liveness (200 = tun0 up)
+curl -x http://127.0.0.1:18011 https://api.ipify.org        # exit IP via HTTP CONNECT
+curl --socks5-hostname 127.0.0.1:18011 https://api.ipify.org # exit IP via SOCKS5 TCP
+curl http://127.0.0.1:18011/healthz                          # liveness (200 = tun0 up)
 ```
+
+UDP (SOCKS5 `UDP ASSOCIATE`) uses the same host port published with `/udp`;
+clients send datagrams to that port while the TCP control connection stays
+open. Note: the `BND.PORT` field in the ASSOCIATE reply reports the
+in-container port (`8888`); behind Docker port mapping, send datagrams to
+the published host port instead.
 
 ### docker compose
 
@@ -91,7 +106,8 @@ docker build -t oxitun .
 | `VPN_USER` | — (required) | VPN username |
 | `VPN_PASS` | — (required) | VPN password |
 | `VPN_PROFILE` | `/etc/openvpn/client.ovpn` | Path to `.ovpn` profile |
-| `PROXY_PORT` | `8888` | CONNECT proxy listen port |
+| `PROXY_PORT` | `8888` | CONNECT/SOCKS5 proxy listen port (TCP + UDP) |
+| `UDP_ADVERTISE_PORT` | `PROXY_PORT` | Port announced in SOCKS5 UDP ASSOCIATE `BND.PORT` — set to the published host port when behind Docker port mapping |
 | `VPN_DNS` | `10.2.0.1` | Resolver forced inside the tunnel |
 | `KILLSWITCH` | `on` | `off` disables iptables rules (**debug only**) |
 
@@ -115,9 +131,13 @@ The published image is multi-stage (`rust:alpine` → `alpine:3.20`) and only
 
 ## Notes & limitations
 
-- OpenVPN **TCP client** profiles only (e.g. ProtonVPN `.ovpn` files)
+- OpenVPN **UDP and TCP client** profiles supported (UDP profiles also carry
+  the tunneled UDP traffic end-to-end)
 - `auth-user-pass` profiles only — no certificates/client-key auth yet
-- Plain-HTTP forward proxying is not implemented (CONNECT only)
+- Plain-HTTP forward proxying is not implemented (CONNECT + SOCKS5 only)
+- SOCKS5 UDP ASSOCIATE limits: upstream is IPv4-only; one UDP client per
+  source IP; SOCKS fragmentation (`FRAG != 0`) is dropped; max datagram
+  64 KiB; domain-name destinations are resolved inside the relay loop
 - Run **one tunnel per container**; scale by running N containers
 - Tested with ProtonVPN free-server profiles; other providers unverified
 - Free-tier servers are flaky by nature — pair this with an external
@@ -129,6 +149,28 @@ The published image is multi-stage (`rust:alpine` → `alpine:3.20`) and only
 docker build -t oxitun .
 # or locally: cargo build --release
 ```
+
+## Git & releases
+
+Commits are local-only until pushed — committing never publishes anything.
+Publishing to `ghcr.io/oxitun/oxitun` is done by the GitHub Actions
+workflow (`.github/workflows/docker.yml`) and happens **only** on:
+
+- `git push origin main` → updates the `latest` tag
+- `git push origin vX.Y.Z` (tag `v*`) → also publishes a semver tag
+
+To work without publishing, push to a branch instead:
+
+```bash
+git checkout -b my-feature
+git commit -am "..."
+git push -u origin my-feature   # CI does NOT run on non-main branches
+```
+
+Or simply don't push at all — `git commit` stays on your machine.
+Manual `docker push` requires a GitHub PAT with `write:packages`;
+the CI path needs no local credentials (`GITHUB_TOKEN` has
+`packages: write`).
 
 ## License
 

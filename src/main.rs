@@ -12,10 +12,15 @@ mod proxy;
 
 use std::env;
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const AUTH_FILE: &str = "/run/oxitun-auth.txt";
+const TUN_WAIT: Duration = Duration::from_secs(90);
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key)
@@ -25,7 +30,7 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// First non-empty value among `keys`, erroring with all names listed.
+/// Primeiro valor não vazio entre `keys`; erro listando todos os nomes.
 fn first_env(keys: &[&str]) -> Result<String, String> {
     for key in keys {
         let v = env_or(key, "");
@@ -36,8 +41,7 @@ fn first_env(keys: &[&str]) -> Result<String, String> {
     Err(format!("{} required", keys.join(" or ")))
 }
 
-/// `docker --env-file` keeps literal quotes; compose interpolation strips
-/// them. Normalize both forms.
+/// `docker --env-file` mantém aspas literais; a interpolação do compose as remove.
 fn strip_quotes(s: &str) -> String {
     let t = s.trim();
     let t = t.strip_prefix('"').unwrap_or(t);
@@ -46,8 +50,21 @@ fn strip_quotes(s: &str) -> String {
     t.strip_suffix('\'').unwrap_or(t).to_string()
 }
 
+/// Killswitch ligado por padrão; desliga apenas com valores explícitos.
+fn killswitch_enabled(raw: &str) -> bool {
+    !matches!(
+        raw.trim().to_lowercase().as_str(),
+        "off" | "0" | "false" | "no" | "n" | "disabled"
+    )
+}
+
+/// Registra mensagem em stderr com timestamp (segundos UNIX).
 fn log(msg: &str) {
-    eprintln!("[oxitun] {msg}");
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    eprintln!("[oxitun {ts}] {msg}");
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
@@ -64,17 +81,25 @@ fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// Remote IPs declared in the .ovpn profile (needed for the killswitch
-/// allowlist: the VPN connection itself must pass before tun0 exists).
+/// Aplica o mesmo comando a iptables (IPv4) e ip6tables (IPv6).
+fn both(args: &[&str]) -> Result<(), String> {
+    for tbl in ["iptables", "ip6tables"] {
+        run(tbl, args)?;
+    }
+    Ok(())
+}
+
+/// IPs remotos do .ovpn. Necessários na allowlist porque a conexão VPN
+/// precisa passar antes de tun0 existir.
 fn remote_ips(profile: &Path) -> Result<Vec<String>, String> {
     let text = fs::read_to_string(profile)
         .map_err(|e| format!("read {}: {e}", profile.display()))?;
-    let mut ips = Vec::new();
+    let mut ips: Vec<String> = Vec::new();
     for line in text.lines() {
         let mut it = line.split_whitespace();
         if it.next() == Some("remote") {
             if let Some(ip) = it.next() {
-                if !ips.contains(&ip.to_string()) {
+                if !ips.iter().any(|x| x == ip) {
                     ips.push(ip.to_string());
                 }
             }
@@ -86,100 +111,102 @@ fn remote_ips(profile: &Path) -> Result<Vec<String>, String> {
     Ok(ips)
 }
 
-fn iptables_flush() -> Result<(), String> {
-    // ip6tables has no usable nat/mangle in this context — filter only.
-    for tbl in ["iptables", "ip6tables"] {
-        run(tbl, &["-F"])?;
-    }
+/// Política DROP antes do flush: a janela ACCEPT durante a limpeza é fechada.
+fn apply_base_policy() -> Result<(), String> {
+    both(&["-P", "INPUT", "DROP"])?;
+    both(&["-P", "FORWARD", "DROP"])?;
+    both(&["-P", "OUTPUT", "DROP"])?;
+    both(&["-F"])?;
     run("iptables", &["-t", "nat", "-F"])?;
     run("iptables", &["-t", "mangle", "-F"])?;
     Ok(())
 }
 
-fn iptables_policy() -> Result<(), String> {
-    for tbl in ["iptables", "ip6tables"] {
-        run(tbl, &["-P", "INPUT", "DROP"])?;
-        run(tbl, &["-P", "FORWARD", "DROP"])?;
-        run(tbl, &["-P", "OUTPUT", "DROP"])?;
-    }
-    Ok(())
-}
-
-fn iptables_rule(tbl: &str, args: &[&str]) -> Result<(), String> {
-    run(tbl, args)
-}
-
 fn install_killswitch(profile: &Path, proxy_port: u16) -> Result<(), String> {
     let servers = remote_ips(profile)?;
     log(&format!("killswitch on — VPN servers: {}", servers.join(" ")));
+    apply_base_policy()?;
 
-    iptables_flush()?;
-    iptables_policy()?;
+    let port = proxy_port.to_string();
 
-    // INPUT: local, tunnel, established replies, proxy port on eth0.
-    for tbl in ["iptables", "ip6tables"] {
-        iptables_rule(tbl, &["-A", "INPUT", "-i", "lo", "-j", "ACCEPT"])?;
-        iptables_rule(tbl, &["-A", "INPUT", "-i", "tun0", "-j", "ACCEPT"])?;
-        iptables_rule(tbl, &[
-            "-A", "INPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT",
-        ])?;
-    }
-    iptables_rule("iptables", &[
-        "-A", "INPUT", "-i", "eth0", "-p", "tcp", "--dport", &proxy_port.to_string(), "-j",
-        "ACCEPT",
+    // INPUT: loopback, túnel, respostas estabelecidas, proxy na eth0.
+    both(&["-A", "INPUT", "-i", "lo", "-j", "ACCEPT"])?;
+    both(&["-A", "INPUT", "-i", "tun0", "-j", "ACCEPT"])?;
+    both(&["-A", "INPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"])?;
+    run("iptables", &[
+        "-A", "INPUT", "-i", "eth0", "-p", "tcp", "--dport", port.as_str(), "-j", "ACCEPT",
+    ])?;
+    run("iptables", &[
+        "-A", "INPUT", "-i", "eth0", "-p", "udp", "--dport", port.as_str(), "-j", "ACCEPT",
     ])?;
 
-    // OUTPUT: local, tunnel, established, VPN servers (any port, IPv4 only).
-    for tbl in ["iptables", "ip6tables"] {
-        iptables_rule(tbl, &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"])?;
-        iptables_rule(tbl, &["-A", "OUTPUT", "-o", "tun0", "-j", "ACCEPT"])?;
-        iptables_rule(tbl, &[
-            "-A", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT",
-        ])?;
-    }
+    // OUTPUT: loopback, túnel, respostas estabelecidas, servidores VPN (IPv4).
+    both(&["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"])?;
+    both(&["-A", "OUTPUT", "-o", "tun0", "-j", "ACCEPT"])?;
+    both(&["-A", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"])?;
     for ip in &servers {
-        iptables_rule("iptables", &["-A", "OUTPUT", "-d", ip, "-j", "ACCEPT"])?;
+        run("iptables", &["-A", "OUTPUT", "-d", ip.as_str(), "-j", "ACCEPT"])?;
     }
     Ok(())
 }
 
-fn write_resolv_conf(dns: &str) -> Result<(), String> {
-    fs::write("/etc/resolv.conf", format!("nameserver {dns}\n"))
-        .map_err(|e| format!("/etc/resolv.conf: {e}"))
-}
-
-fn write_auth_file(user: &str, pass: &str) -> Result<String, String> {
-    let path = "/run/oxitun-auth.txt";
-    fs::write(path, format!("{user}\n{pass}\n")).map_err(|e| format!("{path}: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+/// Escreve o resolver do túnel. Falha não é fatal: com o killswitch ativo,
+/// o DNS do host fica bloqueado, então a resolução falha fechada.
+fn write_resolv_conf(dns: &str) {
+    if let Err(e) = fs::write("/etc/resolv.conf", format!("nameserver {dns}\n")) {
+        log(&format!("aviso: /etc/resolv.conf não gravado ({e}); DNS só via túnel se o runtime permitir"));
     }
-    Ok(path.to_string())
 }
 
-fn tun0_exists() -> bool {
-    Path::new("/sys/class/net/tun0").exists()
+/// Grava credenciais com modo 0600 já na criação, sem janela de permissão ampla.
+fn write_auth_file(user: &str, pass: &str) -> Result<(), String> {
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(AUTH_FILE)
+        .map_err(|e| format!("{AUTH_FILE}: {e}"))?;
+    f.write_all(format!("{user}\n{pass}\n").as_bytes())
+        .map_err(|e| format!("{AUTH_FILE}: {e}"))
+}
+
+/// Aguarda tun0 até `TUN_WAIT`, abortando se o openvpn já tiver morrido.
+fn wait_for_tun0(child: &mut Child) -> Result<(), String> {
+    let deadline = Instant::now() + TUN_WAIT;
+    loop {
+        if proxy::tun0_up() {
+            return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("openvpn exited before tun0: {status}"));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return Err(format!("tun0 did not come up in {}s", TUN_WAIT.as_secs()));
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn main() {
-    if let Err(e) = run_inner() {
-        eprintln!("[oxitun] FATAL: {e}");
-        std::process::exit(1);
+    match run_inner() {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("[oxitun] FATAL: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
 fn run_inner() -> Result<i32, String> {
-    // VPN_PROFILE > default. Credentials are the provider-agnostic
-    // VPN_USER / VPN_PASS.
     let profile = env_or("VPN_PROFILE", "/etc/openvpn/client.ovpn");
     let profile_path = Path::new(&profile);
     let proxy_port: u16 = env_or("PROXY_PORT", "8888")
         .parse()
         .map_err(|_| "PROXY_PORT must be a valid port".to_string())?;
     let vpn_dns = env_or("VPN_DNS", "10.2.0.1");
-    let killswitch = !matches!(env_or("KILLSWITCH", "on").to_lowercase().as_str(), "off" | "0" | "false" | "no");
+    let killswitch = killswitch_enabled(&env_or("KILLSWITCH", "on"));
 
     let user = strip_quotes(&first_env(&["VPN_USER"])?);
     let pass = strip_quotes(&first_env(&["VPN_PASS"])?);
@@ -192,25 +219,25 @@ fn run_inner() -> Result<i32, String> {
     } else {
         log("killswitch disabled (KILLSWITCH=off)");
     }
-    write_resolv_conf(&vpn_dns)?;
-    let auth_file = write_auth_file(&user, &pass)?;
+    write_resolv_conf(&vpn_dns);
+    write_auth_file(&user, &pass)?;
 
     log(&format!("starting openvpn ({profile})"));
     let mut child = Command::new("openvpn")
         .arg("--config")
         .arg(profile_path)
         .arg("--auth-user-pass")
-        .arg(&auth_file)
+        .arg(AUTH_FILE)
         .arg("--connect-retry")
         .arg("5")
-        // Move to the next `remote` after a few failed rounds instead of
-        // retrying a dead server forever (free-tier flakiness).
+        // Após algumas rodadas falhas, passa para o próximo `remote`
+        // em vez de insistir em um servidor morto (free tier instável).
         .arg("--connect-retry-max")
         .arg("3")
         .arg("--connect-timeout")
         .arg("10")
-        // TLS handshake stall guard: a TCP connection that opens but never
-        // answers the push must not hang the tunnel indefinitely.
+        // Janela de handshake TLS (padrão 60 s): falha rápida se o servidor
+        // não responder ao push, sem travar o túnel indefinidamente.
         .arg("--hand-window")
         .arg("20")
         .stdout(Stdio::inherit())
@@ -218,31 +245,16 @@ fn run_inner() -> Result<i32, String> {
         .spawn()
         .map_err(|e| format!("spawn openvpn: {e}"))?;
 
-    // Wait for tun0 (90s), bailing early if openvpn already died.
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        if tun0_exists() {
-            break;
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!("openvpn exited before tun0: {status}"));
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            return Err("tun0 did not come up in 90s".into());
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
+    wait_for_tun0(&mut child)?;
     log("tun0 up — tunnel established");
 
-    // CONNECT proxy on its own thread; main supervises openvpn.
+    // Proxy CONNECT em thread própria; a main supervisiona o openvpn.
     thread::spawn(move || {
         if let Err(e) = proxy::serve(proxy_port) {
             eprintln!("[oxitun] proxy fatal: {e}");
             std::process::exit(1);
         }
     });
-    // Give the listener a moment to bind before reporting healthy.
     thread::sleep(Duration::from_millis(300));
     log(&format!("proxy listening on :{proxy_port}"));
 
