@@ -37,8 +37,11 @@ per-worker egress IPs for high-throughput API clients.
 |---|---|---|
 | RSS per container | **~1–8 MiB** | ~35–45 MiB |
 | 80 containers total | **~81 MiB** | ~3.0 GiB |
+| 196 containers total (measured 2026-11-27, SOCKS5+UDP build) | **~256 MiB** (~1.3 MiB avg) | — |
 
-Validated in production with 80 concurrent ProtonVPN tunnels.
+Validated in production with 80 concurrent ProtonVPN tunnels; re-measured
+with the production pool of 200 slots (196 running at snapshot time —
+4 cycling on flaky free-tier reconnects).
 
 ## Usage
 
